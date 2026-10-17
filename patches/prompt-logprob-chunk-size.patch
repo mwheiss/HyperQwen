@@ -1,0 +1,44 @@
+Bound temporary prompt-logprob logits on memory-constrained native servers.
+
+The default remains 1024 rows. Set VLLM_PROMPT_LOGPROBS_CHUNK_SIZE=128
+for a large-vocabulary model sharing a 24 GB card with a large KV pool.
+This tiles the LM head and scoring workspace, not the attention/context window.
+Explicitly release each logits tile before allocating the next one.
+
+Kind: compatibility
+What: configurable prompt-logprob workspace and bounded tile lifetime
+Upstream: none
+Cut-against: 0.31.0
+Retires-when: upstream exposes equivalent prompt-logprob memory control
+
+--- a/v1/worker/gpu/sample/prompt_logprob.py
++++ b/v1/worker/gpu/sample/prompt_logprob.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Callable
+ from dataclasses import dataclass
++import os
+ 
+ import numpy as np
+ import torch
+@@ -17,7 +18,9 @@
+     compute_topk_scores,
+ )
+ 
+-CHUNK_SIZE = 1024
++CHUNK_SIZE = int(os.environ.get("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024"))
++if CHUNK_SIZE <= 0:
++    raise ValueError("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE must be positive")
+ 
+ 
+ @dataclass
+@@ -310,6 +313,9 @@
+         token_ids.append(result.logprob_token_ids)
+         scores.append(result.logprobs)
+         ranks.append(result.selected_token_ranks)
++        # Do not keep the previous full-vocabulary logits alive while allocating
++        # the next chunk; only the selected scores are needed after this point.
++        del prompt_logits
+ 
+     token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
+     scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]

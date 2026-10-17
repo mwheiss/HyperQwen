@@ -154,6 +154,15 @@ rejects GCC 16, so forcing the pip 13.0 compiler on such a host introduces a
 host-compiler mismatch even when the system CUDA toolkit supports its compiler.
 Torch's required CUDA runtime libraries remain in the isolated Python environment.
 
+For prompt-logprob scoring with a large KV reservation on a 24 GB card,
+`VLLM_PROMPT_LOGPROBS_CHUNK_SIZE=128` bounds the temporary full-vocabulary
+logits workspace. The default is 1024 rows. This changes LM-head scoring tiles,
+not the attention window or ordinary generation. The GPU regression check is:
+
+```bash
+venv/bin/python bench/test_prompt_logprob_chunk_size.py
+```
+
 Then `bash verify.sh --no-server` — it checks the venv and vLLM version, that
 every compatible patch in `patches/` is actually applied, and that the model has been
 requantized (lm_head, embeddings, MTP module, draft head). Then pick a mode

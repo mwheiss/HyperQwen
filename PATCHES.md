@@ -103,3 +103,8 @@ Six files have one line of prose or none above their headers, because their fork
 `spec-decode-int4-kv-mq3d` and `vllm-pr50021-gdn-spec-bounds` have one line. Their `What:` headers describe them, and
 `docs/wsl2-4090.md` ("CPU offload tier under WSL2") explains `offload-wsl2-devptr`. Prose comes from the fork commit
 body and a re-export, not from an edit to the file.
+
+Native memory control: `prompt-logprob-chunk-size.patch` exposes
+`VLLM_PROMPT_LOGPROBS_CHUNK_SIZE` (default 1024). A value of 128 bounds the
+full-vocabulary logits workspace for prompt scoring on a 24 GB GPU. It also
+releases the previous logits tile before allocating the next one.
