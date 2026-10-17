@@ -131,6 +131,29 @@ bash kvarn/install.sh
 openssl rand -hex 24 > api_key.txt
 ```
 
+### Reusing a complete system CUDA toolkit
+
+On a native host with a complete CUDA 13 toolkit and a supported system compiler,
+prefer that toolkit for JIT builds. Set `CUDA_HOME` so both nvcc **and its headers**
+come from it; matching nvcc to the headers does not require matching the minor
+version in `torch.version.cuda`. For example, CachyOS with CUDA 13.4.92 and GCC 16
+served this vLLM 0.31.0 / torch 2.13.0+cu130 stack and passed all twelve
+`bench/api_smoke.py` checks with:
+
+```bash
+export CUDA_HOME=/opt/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+export CC=/usr/bin/gcc CXX=/usr/bin/g++ NVCC_CCBIN=/usr/bin/g++
+```
+
+The four `nvidia-cuda-nvcc`, `nvidia-cuda-crt`, `nvidia-cuda-cccl`, and
+`nvidia-nvvm` compiler packages in the example install are fallback tooling for
+hosts without a suitable toolkit; they are unnecessary with this system setup.
+Do not combine the system nvcc with the pip toolkit's headers. CUDA 13.0 also
+rejects GCC 16, so forcing the pip 13.0 compiler on such a host introduces a
+host-compiler mismatch even when the system CUDA toolkit supports its compiler.
+Torch's required CUDA runtime libraries remain in the isolated Python environment.
+
 Then `bash verify.sh --no-server` — it checks the venv and vLLM version, that
 every compatible patch in `patches/` is actually applied, and that the model has been
 requantized (lm_head, embeddings, MTP module, draft head). Then pick a mode
