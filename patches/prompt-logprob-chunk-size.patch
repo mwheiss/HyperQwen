@@ -5,12 +5,16 @@ for a large-vocabulary model sharing a 24 GB card with a large KV pool.
 This tiles the LM head and scoring workspace, not the attention/context window.
 Explicitly release each logits tile before allocating the next one.
 
-Kind: compatibility
+Kind: fix
 What: configurable prompt-logprob workspace and bounded tile lifetime
 Upstream: none
 Cut-against: 0.31.0
 Retires-when: upstream exposes equivalent prompt-logprob memory control
 
+--- exported from 28dabc2 (prompt-logprob-chunk-size); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/worker/gpu/sample/prompt_logprob.py b/v1/worker/gpu/sample/prompt_logprob.py
+index 24fdb61..0a39e93 100644
 --- a/v1/worker/gpu/sample/prompt_logprob.py
 +++ b/v1/worker/gpu/sample/prompt_logprob.py
 @@ -2,6 +2,7 @@
