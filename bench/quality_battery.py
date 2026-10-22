@@ -21,13 +21,18 @@ read 10.76. If it comes back, compare against caching off, which is PREFIX_CACHE
 again.
 SPEC=off, SPEC=dflash2 and CTX=fast were never affected, so the published quality
 tables are not implicated.
-Usage: python bench/quality_battery.py <tag> [--ppl-only] [--gsm-only] [--gsm-n 200]
+Usage: venv/bin/python bench/quality_battery.py <tag> [--ppl-only] [--gsm-only] [--gsm-n 200]
+Set CODE_CORPUS_DIR to one fixed vllm package directory for all compared arms.
+PPL requires a source tree (explicit, checkout venv, or active install fallback).
+--gsm-only does not read the code corpus or require a local vLLM install.
 """
 import json, os, sys, glob, re, math, time, random
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import pyarrow.parquet as pq
 
 import harness
+from code_corpus import source_files
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # data dir: wikitext-2 test parquet, fineweb-2 dan_Latn test parquet, gsm8k test parquet (see README)
@@ -37,6 +42,8 @@ ppl_only = "--ppl-only" in sys.argv; gsm_only = "--gsm-only" in sys.argv
 gsm_n = int(sys.argv[sys.argv.index("--gsm-n")+1]) if "--gsm-n" in sys.argv else 200
 
 def docs():
+    # Resolve before reading parquet: never silently omit the code cohort.
+    src, files = source_files("v1/core")
     out = []
     t = pq.read_table(f"{Q}/wikitext/wikitext-2-raw-v1/test-00000-of-00001.parquet").column("text").to_pylist()
     txt = "".join(t); 
@@ -48,12 +55,17 @@ def docs():
         if len(d) > 1500:
             out.append(("da", d[:1200])); n+=1
         if n>=40: break
-    files = sorted(glob.glob(os.path.join(HERE, "..", "venv/lib/python3.12/site-packages/vllm/v1/core/*.py")))
+    selected = 0
     for f in files:
-        s = open(f).read()
+        s = Path(f).read_text(encoding="utf-8")
+        selected += 1
         for i in range(0, min(len(s), 4*1200), 1200):
             if len(s[i:i+1200]) > 800: out.append(("code", s[i:i+1200]))
         if sum(1 for l,_ in out if l=="code") >= 40: break
+    windows = sum(1 for lang, _ in out if lang == "code")
+    if not windows:
+        raise RuntimeError(f"No eligible code windows under {src}; set CODE_CORPUS_DIR to a fixed vllm package directory")
+    print(f"code corpus: {src}; {selected} selected / {len(files)} source files, {windows} windows", flush=True)
     return out
 
 def ppl_one(item):
@@ -103,10 +115,10 @@ def run_gsm():
     acc = sum(1 for ok,_ in res if ok)/len(res); toks = sum(n for _,n in res)/len(res)
     return acc, toks
 
-t0=time.time(); result={"tag":tag}
+t0=time.perf_counter(); result={"tag":tag}
 if not gsm_only:
-    result["ppl"] = run_ppl(); print(tag, "PPL", {k:(round(v[0],4),v[1]) for k,v in result["ppl"].items()}, f"{time.time()-t0:.0f}s", flush=True)
+    result["ppl"] = run_ppl(); print(tag, "PPL", {k:(round(v[0],4),v[1]) for k,v in result["ppl"].items()}, f"{time.perf_counter()-t0:.0f}s", flush=True)
 if not ppl_only:
-    t1=time.time(); acc, toks = run_gsm(); result["gsm8k"]={"n":gsm_n,"acc":acc,"mean_tokens":toks}
-    print(tag, f"GSM8K n={gsm_n} acc={acc:.3f} mean_tokens={toks:.0f} {time.time()-t1:.0f}s", flush=True)
+    t1=time.perf_counter(); acc, toks = run_gsm(); result["gsm8k"]={"n":gsm_n,"acc":acc,"mean_tokens":toks}
+    print(tag, f"GSM8K n={gsm_n} acc={acc:.3f} mean_tokens={toks:.0f} {time.perf_counter()-t1:.0f}s", flush=True)
 with open(os.path.join(Q, f"result_{tag}.json"),"w") as f: json.dump(result,f)

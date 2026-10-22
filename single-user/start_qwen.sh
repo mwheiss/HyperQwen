@@ -25,21 +25,31 @@
 # CTX=long: fp8 KV via FlashInfer, 150k context, 3 drafts (k=4 crashes on
 #   FlashInfer as soon as one request finishes while another is mid-generation,
 #   vLLM 0.28.0); the split-KV attention patch is bf16-KV only, so ~90/98 tok/s.
+#   On a compute capability 8.6 GPU with pthfa/ installed, PTH_FA (below) makes int8 KV on the
+#   pth-flash-attn kernel the default here instead; PTH_FA=0 keeps fp8 on FlashInfer.
 #   KNOW THE EXPOSURE: fp8 KV has exactly ONE backend on sm86 -- FLASH_ATTN
 #   refuses it (needs FA3/SM90+) and TRITON_ATTN refuses it (needs SM89+),
 #   both measured -- so this tier runs FlashInfer with no A/B possible, and
 #   issue #34 tracks a deterministic Xid-31 MMU write-fault seen twice on one
 #   3090 under fp8+MTP+prefix caching at ~28-34k context. The flashinfer-free
-#   fallback is the int8 tier (gotcha 40): what SPEC=dflash2 CTX=long already
-#   ships, or for mtp: VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend
+#   fallback is the int8 tier (gotcha 40): SPEC=dflash2 CTX=long FA2_FP8KV=0, or for mtp: VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend
 #   =TRITON_ATTN --kv-cache-dtype=int8_per_token_head" at ~25% wall cost at
 #   depth (23.7 vs 18.9 s for 17.9k in + 256 out, measured). At chat length
 #   that escape is +2.5% end-to-end and quality-neutral, but it costs 16% of
 #   the KV pool and decays hard past 25k (-34% decode / -44% prefill at 60k);
 #   SPEC=dflash2 CTX=fast is +31% over it at C1. Use it as the #34 fallback,
 #   not as the fast path. Numbers in gotcha 40.
+# FA2_FP8KV (default 1 on SPEC=dflash2 CTX=long on a compute capability 8.6 GPU): fp8 KV with the
+#   FA2 plugin (fa2/, bash fa2/install.sh) instead of int8 + Triton. FA2_FP8KV=0 restores int8 +
+#   Triton, and KV_OFFLOAD_GB, PTH_FA (set or defaulted to 1) or another GPU turns the default off.
+#   See the arm below.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
+# PTH_FA (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only): int8 per-token-head KV read by the
+#   pth-flash-attn kernel (pthfa/), on the target and the MTP drafter instead of fp8 on FlashInfer,
+#   or on the DFlash2 target and drafter instead of TRITON_ATTN — see below. Default 0, except 1 on
+#   SPEC=dflash2 CTX=long and SPEC=mtp CTX=long on a compute capability 8.6 GPU with the package
+#   installed and the measured setup (resolve_config.sh); PTH_FA=0 opts out.
 #
 # Fast variant: MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when it
 # exists (int4-GPTQ lm_head + MTP, own-output draft vocab; drafter/README.md), else
@@ -198,6 +208,7 @@ USER_MAX_LEN=${MAX_LEN:-}
 # CTX validation lives in resolve_config.sh (called above), which refuses
 # unknown values before anything boots — so every arm here is reachable and
 # no silent else-fallthrough exists.
+FA2_SPEC_ATTN=   # set by the FA2_FP8KV arm below
 if [ "$CTX" = "fast" ]; then
   MAX_LEN=${MAX_LEN:-65536}
   DRAFT_TOKENS=${DRAFT_TOKENS:-4}
@@ -214,7 +225,7 @@ elif [ "$CTX" = "long" ]; then
   ATTN_ARGS="--kv-cache-dtype fp8"
 fi
 if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
-  # int8 per-token-head KV on the Triton backend: the same 5.2 GiB pool holds 136,429
+  # int8 per-token-head KV on the Triton backend (the FA2_FP8KV=0 arm; see below): the same 5.2 GiB pool holds 136,429
   # tokens instead of 69,758, because patches/hybrid-sw-block-promote.patch stops the
   # drafter's 5 sliding-window layers from taking 385 nearly-empty blocks, and
   # patches/spec-decode-int8-kv.patch lets the split-KV verify kernel read the quantized
@@ -226,6 +237,29 @@ if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
   # not for general chat.
   ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head"
   export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-1}
+  # FA2_FP8KV=1 (the default on this arm on an 8.6 GPU, FA2_FP8KV=0 restores the int8 + Triton line above): fp8
+  # KV on FLASH_ATTN through the fa2/ plugin. The kernel is not vLLM's: FA2 does not read fp8 KV
+  # on sm86 and the plugin supplies it, with its own split-KV for the verify block. Needs
+  # `bash fa2/install.sh` (the Docker image has it); the T4 battery and #153 hold the evidence.
+  # The drafter must select FLASH_ATTN too (SPEC_CFG below), or it stays on the default backend.
+  # Exporting FA2_FP8KV is the plugin's gate: its register() replaces FLASH_ATTN only when it is 1.
+  # resolve_config.sh has resolved the default and refused any other SPEC/CTX and the KV offload
+  # tier. A missing install refuses rather than falling back: a fallback would make the default
+  # arm depend on whether a build step happened.
+  if [ "${FA2_FP8KV:-0}" = 1 ]; then
+    "$REPO/venv/bin/python" -c 'import fa2_fp8kv_vllm.paths as p; p.check()' >/dev/null 2>&1 \
+      || { echo "start_qwen: refusing: FA2_FP8KV=1 (${FA2_FP8KV_SRC:-explicit}) but the FA2 fp8 plugin is not installed in venv (run: bash fa2/install.sh, or set FA2_FP8KV=0 for the int8 + Triton arm)" >&2; exit 1; }
+    ATTN_ARGS="--attention-backend FLASH_ATTN --kv-cache-dtype fp8"
+    FA2_SPEC_ATTN=',"attention_backend":"FLASH_ATTN"'
+    export FA2_FP8KV=1
+    # The split-KV verify (patches/spec-decode-attn.patch:76-93) and the int8 prefill
+    # (patches/prefill-attn-int8.patch:73-75) hook FlashAttentionImpl.forward, which the plugin's
+    # impl replaces, and both are gated `not is_quantized_kv_cache`, which fp8 is. The env cannot
+    # reach them on this arm, so say 0 rather than leave the 1 above to mean something.
+    export VLLM_SPEC_DECODE_ATTN=0
+    [ -z "${SPEC_ATTN:-}" ] || [ "$SPEC_ATTN" = 0 ] \
+      || echo "[start_qwen] FA2_FP8KV=1: SPEC_ATTN=$SPEC_ATTN has no effect, the plugin brings its own split-KV verify" >&2
+  fi
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "huge" ]; then
   # KVarN 4/2-bit KV on the V2 runner (kvarn/, with kvarn-v2-runner-0.28.0.patch as its
   # second stage): the pinned pool holds 268k tokens at 245760 max-model-len.
@@ -235,6 +269,97 @@ elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "huge" ]; then
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" != "fast" ]; then
   echo "SPEC=dflash2 supports CTX=fast (bf16, 64k), CTX=long (int8, 128k) and CTX=huge (KVarN, 240k; kvarn/install.sh); CTX=$CTX keeps SPEC=mtp" >&2
   SPEC=mtp
+fi
+# PTH_FA=1: SPEC=mtp CTX=long on an int8_per_token_head KV cache read by the pth-flash-attn kernel
+# (pthfa/, built into the image by pthfa/install.sh) instead of fp8 on FlashInfer. The backend is the
+# plugin slot CUSTOM, on the target AND the MTP drafter: a drafter takes its attention backend from the
+# speculative config, so "attention_backend":"CUSTOM" goes in there too -- it is the setting that is easy
+# to drop. Decode and verify batches are captured FULL (the backend supports UNIFORM_BATCH graphs; the
+# mode stays vLLM's default). On 2x RTX 3080 20 GB at TP=2, vLLM 0.30.0, against TRITON_ATTN on the same
+# cache: 128k TTFT 129 s against 250 s, N=1 decode at 128k 85-92 against 46 tok/s, MTP tokens per step
+# and GSM8K unchanged (docs/long-context.md has the table, the hardware and the launch line; gotcha 63 the
+# limits). Unset, it defaults to 1 on a compute capability 8.6 GPU with the package installed and this arm's
+# measured setup (DRAFT_TOKENS unset or 3, no DYNAMIC_K, no VISION=1; resolve_config.sh), else the argv and the
+# environment are those of the arm without it; PTH_FA=0 opts out.
+# SPEC=dflash2 CTX=long: the arm's own int8_per_token_head cache, read by the kernel on the target AND the
+# DFlash2 drafter. The drafter's five layers are sliding-window (2048) and non-causal at head size 128,
+# which the kernel serves (its windowed kernels exist at head size 128 only; gotcha 63), so its speculative
+# config gets "attention_backend":"CUSTOM" as the mtp one does. It gets no kv_cache_dtype, so the drafter's
+# cache keeps the target's int8_per_token_head (vLLM overrides the drafter's dtype only when that key is
+# set). VLLM_SPEC_DECODE_ATTN stays as the arm sets it; it is read only by the FLASH_ATTN and TRITON_ATTN
+# impls (patches/spec-decode-attn.patch, spec-decode-int8-kv.patch), so with both models on CUSTOM nothing
+# reads it. Only the measured drafting setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or
+# dflash), DFLASH_TOKENS unset or 7, LOOKUP unset or 1 and DYNAMIC_K unset; anything else on this arm is
+# refused. Capped 2x RTX 3080 20 GB at TP=2, vLLM 0.31.0, one sitting (2026-10-17/18), N=1 decode at 128k:
+# 115.1 tok/s with PTH_FA=1, 81.5 on the FA2 fp8 default, 58.6 on TRITON_ATTN int8; ms per pass 28.4 /
+# 36.8 / 55.0; FA2 has the shorter cold 128k prefill (114.1 against 122.1 s) and the larger KV pool
+# (517,656 against 504,770 tokens) (docs/long-context.md).
+# On a compute capability 8.6 GPU this arm defaults to PTH_FA=1 when the package is installed and the launch
+# is the measured one, and otherwise to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above). PTH_FA=1, set or
+# defaulted, overrides the FA2 default, and an explicit FA2_FP8KV=1 with an explicit PTH_FA=1 is refused; all
+# of it happens in resolve_config.sh, before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
+PTH_FA=${PTH_FA:-0}
+PTH_SPEC_BACKEND=
+if [ "$PTH_FA" = 1 ]; then
+  case "$SPEC/$CTX" in
+    mtp/long|dflash2/long) ;;
+    *)
+      echo "PTH_FA=1 is a SPEC=mtp CTX=long or SPEC=dflash2 CTX=long setting (got SPEC=$SPEC CTX=$CTX);" >&2
+      echo "  refusing rather than booting an arm it was not measured on. Unset PTH_FA, or set one of those." >&2
+      exit 1 ;;
+  esac
+  if [ "$SPEC" = dflash2 ]; then
+    if [ "${DRAFT_METHOD:-dflash}" != dflash ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with the DFlash2 drafter only; DRAFT_METHOD=$DRAFT_METHOD is a" >&2
+      echo "  different drafter, untested next to this backend. Unset DRAFT_METHOD, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ "${DFLASH_TOKENS:-7}" != 7 ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured at DFLASH_TOKENS=7 (an 8-token verify block); DFLASH_TOKENS=$DFLASH_TOKENS" >&2
+      echo "  changes the target's verify block (and above 7 makes its length adaptive), untested on this backend." >&2
+      echo "  Unset DFLASH_TOKENS, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ "${LOOKUP:-1}" != 1 ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with lookup drafting on; LOOKUP=$LOOKUP is untested on this" >&2
+      echo "  backend. Unset LOOKUP, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ -n "${DYNAMIC_K:-}" ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with a fixed verify block of 8 tokens; DYNAMIC_K=$DYNAMIC_K sets the" >&2
+      echo "  draft count per batch size, which changes the query length per batch, untested on this backend." >&2
+      echo "  Unset DYNAMIC_K, or PTH_FA." >&2
+      exit 1
+    fi
+  fi
+  case " ${EXTRA_ARGS:-} " in
+    *" --attention-backend"*|*" --kv-cache-dtype"*|*" --speculative-config"*)
+      echo "PTH_FA=1 sets --attention-backend, --kv-cache-dtype and the speculative config itself;" >&2
+      echo "  EXTRA_ARGS carries one of them and would override it. Remove it from EXTRA_ARGS." >&2
+      exit 1 ;;
+    *"--kv-offloading-size"*|*"--kv-transfer-config"*)
+      echo "PTH_FA=1 with a KV connector (KV_OFFLOAD_GB, --kv-offloading-size, --kv-transfer-config) is" >&2
+      echo "  untested on this backend; refusing. Use PTH_FA=0 for a CPU KV tier." >&2
+      exit 1 ;;
+  esac
+  pthfa_installed || {
+    echo "PTH_FA=1 needs the pth_flash_attn package and its op library in the venv: bash pthfa/install.sh" >&2
+    echo "  (the Docker image has it), or PTH_FA=0." >&2
+    exit 1
+  }
+  ATTN_ARGS="--attention-backend CUSTOM --kv-cache-dtype int8_per_token_head"
+  PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
+  if [ "$SPEC" = mtp ]; then
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
+  else
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and DFlash2" >&2
+    echo "  drafter on CUSTOM: the drafter's sliding-window, non-causal layers run the kernel's windowed path (head size 128)" >&2
+  fi
+  [ "${FA2_FP8KV_SRC:-}" = "PTH_FA=1 overrides the 8.6 default" ] \
+    && echo "[start_qwen] PTH_FA=1: FA2_FP8KV=0, PTH_FA=1 overrides the 8.6 default (fp8 KV on the FA2 plugin)" >&2
+elif [ "$PTH_FA" != 0 ]; then
+  echo "PTH_FA=$PTH_FA: set it to 0 or 1" >&2
+  exit 1
 fi
 if [ "$SPEC" = "dflash2" ]; then
   if [ -z "$DRAFT" ]; then
@@ -270,7 +395,7 @@ if [ "$SPEC" = "dflash2" ]; then
   # DRAFT_METHOD=dspark runs a DSpark drafter (RadixArk/Qwen3.8-27B-DSpark, seven drafts per
   # step like the shipped head) through the same profile; it needs
   # patches/dspark-draft-quant-config.patch and the architecture rename in the README.
-  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
+  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"${PTH_SPEC_BACKEND}${FA2_SPEC_ATTN}}"
   # The split-KV verify attention (patches/spec-decode-attn.patch) sizes its partial
   # buffers once for the longest query block it will see -- a captured CUDA graph holds
   # their addresses, so they must not be grown later.
@@ -456,10 +581,12 @@ if [ "$SPEC" = "dflash2" ]; then
   #     PREFIX_CACHE=0 measured the same 54 pages at k=7 as PREFIX_CACHE=1.
   # bench/test_resident_print.sh checks this against eight measured boots: block and pool exact,
   # resident counts inside the ~1k range, exact at 61k, and exact at 32k where it was measured.
+  # fp8 (the FA2_FP8KV=1 arm) has no seat count yet: its block 880 and pool 387 are the one pair
+  # that gives the 140,902-token pool the #153 boot logged.
   # At ~1k the engine charges fewer attention pages than the formula (none on int8), which is
-  # why that end is a range. Unmeasured setups print nothing: KV dtypes other than bf16 and
-  # int8_per_token_head, a wider SSM state, an explicit --block-size, TP or PP > 1 (each rank
-  # holds a share of the heads or layers), a MAX_LEN that is not a plain decimal token count
+  # why that end is a range. Unmeasured setups print nothing: KV dtypes other than bf16,
+  # int8_per_token_head and fp8, a wider SSM state, an explicit --block-size, TP or PP > 1
+  # (each rank holds a share of the heads or layers), a MAX_LEN that is not a plain decimal token count
   # (vLLM also takes 64k or auto), a Mamba cache mode other than align or prefix caching switched
   # off in EXTRA_ARGS (never booted here), and other model shapes.
   RESIDENT_OK=1
@@ -469,6 +596,7 @@ if [ "$SPEC" = "dflash2" ]; then
   case "$RESIDENT_KV" in
     bfloat16|auto|"")    RESIDENT_TGT=4096; RESIDENT_DFT=4096 ;;
     int8_per_token_head) RESIDENT_TGT=2080; RESIDENT_DFT=2112 ;;
+    fp8)                 RESIDENT_TGT=2048; RESIDENT_DFT=2048 ;;
     *)                   RESIDENT_OK=0 ;;
   esac
   case "$RESIDENT_SSM" in float16|bfloat16) RESIDENT_SSM_B=2 ;; *) RESIDENT_OK=0 ;; esac
@@ -539,7 +667,7 @@ elif [ "$SPEC" = "off" ] || [ "$SPEC" = "none" ]; then
   CG=${CG:-32}
 elif [ "$SPEC" = "mtp" ]; then
   MAX_SEQS=${MAX_SEQS:-8}
-  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"}"
+  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"${PTH_SPEC_BACKEND}}"
   CG=${CG:-32}
 else
   echo "SPEC=$SPEC is not a mode: mtp (default), dflash2, off. Refusing rather than" >&2
@@ -772,40 +900,9 @@ if [ "${REQ_METRICS:-0}" = 1 ]; then
                 --per-request-spec-decode-metrics "$SPEC_METRICS")
 fi
 
-# Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
-# 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
-# the tower, for a client that sends images: screenshots into a coding assistant,
-# captioning, document photos.
-#
-# Only --language-model-only needs a knob. It is hardcoded in the exec line below, so
-# the alternative is countering it with --no-language-model-only from EXTRA_ARGS and
-# depending on which flag argparse saw last -- which regresses silently: images are
-# still accepted and still counted as prompt tokens, and the model answers from
-# placeholder embeddings. The two flags VISION=1 adds have no such conflict and can
-# be overridden from EXTRA_ARGS, which is expanded after them. The pixel cap is
-# shipped rather than left to the processor default because vLLM profiles the encoder
-# at the largest image it will accept, and that peak comes out of the KV pool:
-# 2097152 px = 2048 image tokens.
-if [ "${VISION:-0}" = 1 ]; then
-  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
-  # VISION_OFFLOAD keeps the tower's weights in pinned host RAM and copies each module to
-  # the GPU for the duration of its own forward (patches/vision-tower-cpu-offload.patch).
-  # It defaults ON, because on 24 GB SPEC=dflash2 + VISION=1 does not boot without it:
-  # the tower is 0.85 GiB of the ~1.1 GiB transient margin the KV_MEM comment sizes, and
-  # graph capture then dies allocating the split-KV verify buffer --
-  #   torch.OutOfMemoryError: Tried to allocate 960.00 MiB ... 787.50 MiB is free
-  #     (spec_decode_attn.py:184, self.part_o)
-  # measured here, VISION=1 VISION_OFFLOAD=0 SPEC=dflash2, RTX 3090 at 250 W. With the
-  # offload the same config comes up with the full 69,758-token pool and reads images.
-  #
-  # It is close to free: isolated-tower measurement at PCIe 4.0 x16, one 8192-patch image,
-  # median of 10 forwards, 891.3 -> 9.0 MiB of resident weights and 1160.5 -> 308.2 MiB of
-  # peak allocation for 296 -> 333 ms of encode, output bit-exact either way. Set
-  # VISION_OFFLOAD=0 only on a card with room to spare, where 36 ms per image buys nothing.
-  [ "${VISION_OFFLOAD:-1}" = 1 ] && export VLLM_VISION_CPU_OFFLOAD_GB=${VLLM_VISION_CPU_OFFLOAD_GB:-1}
-else
-  VISION_ARGS="--language-model-only"
-fi
+# Shared image limits and tower placement, including the 24 GB offload default.
+# launcher_common.sh: qwen_vision_args; measurements in docs/gotchas.md 8.
+qwen_vision_args
 # EMBED_UVA=1 keeps the quantized token embedding in pinned host RAM, read through a CUDA UVA view
 # (patches/qwen3_5-embed-uva.patch, VLLM_EMBED_UVA). The freed VRAM goes to the KV pool: +15.7% tokens
 # (204,336 to 236,479) at SPEC=mtp CTX=long on a 3090 at PCIe 4.0 x16, decode and prefill unchanged, for
@@ -907,7 +1004,7 @@ qwen_exec venv/bin/vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count $API_SERVERS \
-  ${VISION_ARGS} \
+  "${VISION_ARGS[@]}" \
   $ATTN_ARGS \
   --mamba-ssm-cache-dtype float16 \
   "${ASYNC_ARGS[@]}" \

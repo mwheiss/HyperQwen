@@ -15,6 +15,7 @@ source "$(dirname "$(cd "$(dirname "$0")" && pwd)")/launcher_common.sh" \
   || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
 qwen_normalize_extra_args
 qwen_check_bool_knobs
+qwen_fa2_fp8kv_single_only alternative.sh
 qwen_kv_offload_args
 qwen_prefix_cache
 
@@ -103,8 +104,7 @@ CG=$(( MAX_SEQS * (DRAFT_TOKENS + 1) > 64 ? 64 : MAX_SEQS * (DRAFT_TOKENS + 1) )
 # DFLASH_TOKENS>7 needs the synchronous scheduler, same as start_qwen.sh.
 if [ "$DRAFT_TOKENS" -gt 7 ]; then ASYNC_SCHED=${ASYNC_SCHED:-0}; else ASYNC_SCHED=${ASYNC_SCHED:-1}; fi
 
-VISION_ARGS="--language-model-only"
-[ "$VISION" = 1 ] && VISION_ARGS='--mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+qwen_vision_args
 
 # With the drafter on, pass the retention interval explicitly: 0.30's unset default is 0 (the replay
 # boundaries only), where 0.29 resolved it to dense (vllm #55760); start_qwen.sh has the measurement.
@@ -153,7 +153,7 @@ qwen_exec vllm serve "$MODEL" \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count 1 \
-  ${VISION_ARGS} \
+  "${VISION_ARGS[@]}" \
   ${ATTN_ARGS} \
   --mamba-ssm-cache-dtype float16 \
   "${ASYNC_ARGS[@]}" \

@@ -94,7 +94,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
    8192` inflates the profiled activation peak, which shrinks the cache pool,
    which caps concurrency. 2048 wins on this card.
 8. **`--language-model-only` drops the vision tower cleanly** (no weights
-   loaded), and it is the default in both start scripts. `VISION=1` keeps the
+   loaded), and it is the default in all three launchers. `VISION=1` keeps the
    tower for a client that sends images. The tower is **0.858 GiB**, not the
    2.7 GB this entry used to give: `model.visual.*` sums to 0.858 GiB of BF16 in both
    `Qwen3.8-27B-W4A16-AutoRound` and the `-fast` variant, and a runtime A/B
@@ -798,12 +798,13 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     virtual address twice, ~40 h uptime each) on that combination with MTP +
     prefix caching + chunked prefill at 28-34k context; cause unattributed
     between flashinfer's workspace and the async-scheduling window as of this
-    entry. If you hit it, the flashinfer-free fallback is the int8 tier:
-    `SPEC=dflash2 CTX=long` ships it by default, and for `SPEC=mtp` it is
+    entry. If you hit it, the flashinfer-free fallback is the int8 tier: on a compute capability 8.6 GPU with `pthfa/` installed
+    `SPEC=mtp CTX=long` already defaults to it on the pth-flash-attn kernel (`PTH_FA`, item 63); otherwise
+    `SPEC=dflash2 CTX=long` ships it with `FA2_FP8KV=0` (its 8.6 default without `PTH_FA` is the fa2/ fp8 arm), and for `SPEC=mtp` it is
     `VLLM_SPEC_DECODE_ATTN=1 EXTRA_ARGS="--attention-backend=TRITON_ATTN
     --kv-cache-dtype=int8_per_token_head"`. Measured cost on the reference
     box: 17.9k in + 256 out takes 23.7 s against fp8/FlashInfer's 18.9
-    (~25% wall at that depth, mostly Triton prefill). The default stays
+    (~25% wall at that depth, mostly Triton prefill). Without the 8.6 `PTH_FA` default above the default stays
     fp8/FlashInfer: two faults on one box do not justify that tax on every
     other box, but you should know which combination you are running.
 
@@ -1493,3 +1494,62 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     (upstream #51787; the series' `vllm-pr61050-lru-running-prefix` keeps the
     first chunks, `docs/vllm-0.31.md` has the numbers), so size it above
     what it holds.
+63. **`PTH_FA=1` is two arms and one cache, and an explicit `CUSTOM` it cannot serve fails at load,
+    not quietly.** The pth-flash-attn backend (`pthfa/`, `docs/long-context.md`) serves exactly
+    `--kv-cache-dtype int8_per_token_head` on compute capability 8.0, 8.6 and 8.9 (A100/A30/CMP
+    170HX, RTX 30xx, RTX 40xx), head sizes 64, 128 and 256, decoder self-attention without ALiBi,
+    attention sinks, a logits soft cap, a bidirectional multimodal prefix or R-SWA, and no DCP/PCP.
+    Causal attention is served at all three head sizes; a sliding window and non-causal attention
+    only at head size 128, the shape of the DFlash2 drafter's five layers (window 2048, non-causal,
+    8 query tokens per request; the windowed kernels exist for D = 128 only). The library carries
+    SASS for those three archs and no PTX, so an sm90 or sm120 card is refused rather than
+    JIT-compiled into something nobody measured. Outside the list, an explicit
+    `--attention-backend CUSTOM` stops at model load with `pth_flash_attn does not support: <what>`,
+    and a sliding window or non-causal layer at head size 64 or 256 is refused at backend selection
+    with `... at head size <D> (the windowed kernels exist for D = 128 only)`
+    (`pthfa/tests/gate_test.py` checks each reason); nothing in vLLM selects `CUSTOM` on its own, so
+    an arm that does not ask for it cannot reach it. That is why the knob is gated to
+    `SPEC=mtp CTX=long` and `SPEC=dflash2 CTX=long`, and why its default is narrower still: an unset
+    `PTH_FA` resolves to 1 only on those two arms, on a compute capability 8.6 GPU (the only one
+    measured), with the package installed and the arm's measured setup (on dflash2 no explicit
+    `FA2_FP8KV`, KV offload tier or connector, backend flags in `EXTRA_ARGS`, `DRAFT`, `DRAFT_METHOD`,
+    `DFLASH_TOKENS`, `LOOKUP=0`, `DYNAMIC_K` or `VISION=1`; on mtp no explicit `FA2_FP8KV`, KV offload tier
+    or connector, backend flags in `EXTRA_ARGS`, `DYNAMIC_K`, `VISION=1` or `DRAFT_TOKENS` other than 3);
+    anything else keeps the arm's own default without a word (the FA2 arm on dflash2, fp8 on FlashInfer on
+    mtp), a missing install says so once, and `PTH_FA=0` opts out. The effective-config line says
+    `PTH_FA=1 (default; ...)` or
+    `(explicit; ...)`. On both arms the target and the drafter run
+    `CUSTOM`: a drafter takes its backend from the speculative config, so the knob writes
+    `"attention_backend":"CUSTOM"` there as well as `--attention-backend CUSTOM`. It writes no
+    `kv_cache_dtype` into the speculative config, so the drafter's cache keeps the target's
+    `int8_per_token_head` (vLLM 0.31.0 overrides the drafter's dtype only when that key is set).
+    The other arms are not measured. Refused rather than combined, all untested here: a KV
+    offload tier (`KV_OFFLOAD_GB`); `--attention-backend`, `--kv-cache-dtype` or
+    `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets (the
+    speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and dropping it
+    puts the drafter on another backend); an explicit `FA2_FP8KV=1` with an explicit `PTH_FA=1`, the
+    other knob that picks the dflash2 backend (an unset one, which defaults to 1 on that arm on a compute
+    capability 8.6 GPU, is overridden: `PTH_FA=1`, set or defaulted, keeps it at 0, and the effective-config
+    line reads `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`); and on dflash2 any drafting setup but
+    the measured one: `DRAFT_METHOD` other than
+    `dflash` (a different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the
+    target, adaptive in length above 7), `LOOKUP=0` and `DYNAMIC_K` (a draft count per batch size,
+    which varies the verify block). `VISION=1` on dflash2 is accepted but
+    untested: it adds the vision tower, which does not run on this backend, and leaves the target's
+    attention as it is (on mtp the measured shape has `VISION=1`). There are no tuning knobs: the
+    library reads no environment variables, and its launch shape comes from a planner that is a pure
+    function of the batch descriptor and, for a windowed layer, its window. The numbers so far are
+    from one box, two RTX 3080 20 GB at TP=2, on vLLM 0.30.0 and 0.31.0; on any other card they are
+    still owed (`docs/long-context.md` says which).
+64. **On vLLM 0.31.0 at `GPU_UTIL=0.94`, `prompt_logprobs=10` on a 32k prompt kills the engine with a
+    CUDA OOM, whatever the attention backend.** The V2 runner computes prompt logprobs in chunks of
+    1024 tokens and all-gathers each chunk's logits over the full vocabulary
+    (`v1/worker/gpu/sample/prompt_logprob.py`): 486 MiB wanted with 208 MiB free, `torch.OutOfMemoryError`,
+    HTTP 500, engine dead. Seen on two RTX 3080 20 GB at TP=2 with the `SPEC=mtp CTX=long` production
+    shape (`PREFIX_CACHE=1 VISION=1 MAX_SEQS=2 MAX_LEN=262144`), on `PTH_FA=1`, on `TRITON_ATTN` int8 and
+    on a FlashAttention bf16-KV reference alike, on fresh boots, so it is the engine plus the 0.94 sizing,
+    not this branch or a kernel; the same requests ran on 0.30.0 at the same setting. `GPU_UTIL=0.90`
+    served them on all three, with every KV pool still above 128k tokens. Known class upstream: vllm
+    #5424 and #5907 (prompt_logprobs memory spike; leave headroom). Ordinary generation is not affected;
+    a client that asks for prompt logprobs (perplexity scoring, `bench/quality_battery.py`'s PPL half)
+    needs the headroom.
